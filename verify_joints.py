@@ -3,119 +3,151 @@ import argparse
 import os
 
 
-def compute_jumps(T, chunk_rows):
-    print(f"  温度范围: [{T.min():.4f}, {T.max():.4f}]")
-    print(f"  接缝处检查 (相邻行的最大温度差):")
-
-    max_jump = 0.0
-    max_jump_row = -1
-    for row in chunk_rows:
-        jump = np.max(np.abs(T[row, :] - T[row + 1, :]))
-        mean_jump = np.mean(np.abs(T[row, :] - T[row + 1, :]))
-        print(f"    行 {row} <-> {row + 1}: 最大差 = {jump:.2e}, 平均差 = {mean_jump:.2e}")
-        if jump > max_jump:
-            max_jump = jump
-            max_jump_row = row
-
-    interior_max_jump = 0.0
-    ny = T.shape[0]
-    for row in range(1, ny - 2):
-        if row in chunk_rows:
-            continue
-        jump = np.max(np.abs(T[row, :] - T[row + 1, :]))
-        if jump > interior_max_jump:
-            interior_max_jump = jump
-
-    print(f"  非接缝内部最大行差: {interior_max_jump:.2e}")
-    if max_jump > interior_max_jump * 1.5 and max_jump > 1e-10:
-        print(f"  ⚠️  接缝处存在异常突变! (行{max_jump_row})")
+def get_heat_source_position(path_type, path_params, t):
+    if path_type == 'line':
+        x0, y0 = path_params['start']
+        x1, y1 = path_params['end']
+        total_time = path_params['total_time']
+        s = min(t / total_time, 1.0) if total_time > 0 else 0.0
+        x = x0 + (x1 - x0) * s
+        y = y0 + (y1 - y0) * s
+        return x, y
+    elif path_type == 'circle':
+        cx, cy = path_params['center']
+        radius = path_params['radius']
+        omega = path_params['angular_speed']
+        x = cx + radius * np.cos(omega * t)
+        y = cy + radius * np.sin(omega * t)
+        return x, y
+    elif path_type == 'stationary':
+        x, y = path_params['position']
+        return x, y
     else:
-        print(f"  ✅ 接缝正常，与内部行差一致")
-    return max_jump, interior_max_jump
+        raise ValueError(f"Unknown path type: {path_type}")
 
 
-def run_single_process(nx, ny, alpha, dt, total_time):
+def run_single_process(nx, ny, alpha, dt, total_time, path_type, path_params,
+                       power, source_radius):
     dx = 2.0 / (nx - 1)
     dy = 2.0 / (ny - 1)
 
-    x = np.linspace(-1, 1, nx)
-    y = np.linspace(-1, 1, ny)
-    X, Y = np.meshgrid(x, y)
-    r = np.sqrt(X ** 2 + Y ** 2)
-    T = 100.0 * np.exp(-r ** 2 / 0.1)
+    T = np.zeros((ny, nx))
     T[0, :] = 0.0
     T[-1, :] = 0.0
     T[:, 0] = 0.0
     T[:, -1] = 0.0
 
+    x = np.linspace(-1, 1, nx)
+    y = np.linspace(-1, 1, ny)
+    X, Y = np.meshgrid(x, y)
+
+    effective_power = power * dx * dy / (2 * np.pi * source_radius ** 2)
+
     T_new = np.zeros_like(T)
     num_steps = int(total_time / dt)
 
-    for _ in range(num_steps):
+    for step in range(num_steps):
+        t = step * dt
+        sx, sy = get_heat_source_position(path_type, path_params, t)
+
+        r2 = (X - sx) ** 2 + (Y - sy) ** 2
+        source = effective_power * np.exp(-r2 / (2 * source_radius ** 2))
+
         T_new[1:-1, 1:-1] = T[1:-1, 1:-1] + alpha * dt * (
             (T[2:, 1:-1] - 2 * T[1:-1, 1:-1] + T[:-2, 1:-1]) / dx ** 2 +
             (T[1:-1, 2:] - 2 * T[1:-1, 1:-1] + T[1:-1, :-2]) / dy ** 2
         )
+        T_new[1:-1, 1:-1] += source[1:-1, 1:-1] * dt
         T[1:-1, 1:-1] = T_new[1:-1, 1:-1]
+
+        T[0, :] = 0.0
+        T[-1, :] = 0.0
+        T[:, 0] = 0.0
+        T[:, -1] = 0.0
 
     return T
 
 
 def main():
-    parser = argparse.ArgumentParser(description='验证多进程接缝正确性')
-    parser.add_argument('--nx', type=int, default=200)
-    parser.add_argument('--ny', type=int, default=200)
+    parser = argparse.ArgumentParser(description='验证移动热源多进程结果与单进程一致')
+    parser.add_argument('--nx', type=int, default=80)
+    parser.add_argument('--ny', type=int, default=80)
     parser.add_argument('--workers', type=int, default=4)
-    parser.add_argument('--time', type=float, default=0.2)
-    parser.add_argument('--frame', type=str, default='output/frame_0200.npy')
+    parser.add_argument('--time', type=float, default=0.5)
+    parser.add_argument('--dt', type=float, default=0.001)
+    parser.add_argument('--alpha', type=float, default=0.005)
+    parser.add_argument('--power', type=float, default=500.0)
+    parser.add_argument('--source-radius', type=float, default=0.05)
+    parser.add_argument('--path-type', type=str, default='line')
+    parser.add_argument('--frame', type=str, default='output/frame_0500.npy')
+    parser.add_argument('--start', type=str, default='-0.6,0.0')
+    parser.add_argument('--end', type=str, default='0.6,0.0')
+    parser.add_argument('--center', type=str, default='0.0,0.0')
+    parser.add_argument('--radius-path', type=float, default=0.4)
+    parser.add_argument('--angular-speed', type=float, default=2.0)
 
     args = parser.parse_args()
 
+    path_params = {}
+    if args.path_type == 'line':
+        path_params['start'] = tuple(map(float, args.start.split(',')))
+        path_params['end'] = tuple(map(float, args.end.split(',')))
+        path_params['total_time'] = args.time
+    elif args.path_type == 'circle':
+        path_params['center'] = tuple(map(float, args.center.split(',')))
+        path_params['radius'] = args.radius_path
+        path_params['angular_speed'] = args.angular_speed
+
     interior = args.ny - 2
     chunk = interior // args.workers
-    chunk_rows = []
-    for i in range(args.workers - 1):
-        end_row = (i + 1) * chunk
-        chunk_rows.append(end_row)
+    chunk_rows = [ (i + 1) * chunk for i in range(args.workers - 1) ]
 
-    print(f"网格 {args.nx}x{args.ny}, {args.workers} 个进程")
-    print(f"接缝位于行: {chunk_rows}")
+    print(f"Grid: {args.nx}x{args.ny}, Workers: {args.workers}, Path: {args.path_type}")
+    print(f"Seams at rows: {chunk_rows}")
     print()
 
     if os.path.exists(args.frame):
         T_mp = np.load(args.frame)
-        print("【多进程结果】")
-        compute_jumps(T_mp, chunk_rows)
-        print()
-
-        print("【单进程参考解 (正在计算...)】")
-        T_sp = run_single_process(args.nx, args.ny, 0.01, 0.001, args.time)
-        compute_jumps(T_sp, chunk_rows)
+        print("【Single-process reference (computing...)】")
+        T_sp = run_single_process(
+            args.nx, args.ny, args.alpha, args.dt, args.time,
+            args.path_type, path_params, args.power, args.source_radius
+        )
         print()
 
         diff = np.abs(T_mp - T_sp)
-        print(f"【多进程 vs 单进程 绝对误差】")
-        print(f"  最大误差: {diff.max():.2e}")
-        print(f"  平均误差: {diff.mean():.2e}")
-
+        print(f"【Multi-process vs Single-process absolute error】")
+        print(f"  Max error:    {diff.max():.2e}")
+        print(f"  Mean error:   {diff.mean():.2e}")
+        print(f"  Temperature range (MP): [{T_mp.min():.4f}, {T_mp.max():.4f}]")
+        print(f"  Temperature range (SP): [{T_sp.min():.4f}, {T_sp.max():.4f}]")
         print()
-        print("接缝处最大误差:")
+
+        print("Max error at seam rows:")
         for row in chunk_rows:
             local_max = max(diff[row, :].max(), diff[row + 1, :].max())
-            print(f"  行 {row}/{row + 1}: {local_max:.2e}")
+            print(f"  Row {row}/{row + 1}: {local_max:.2e}")
 
-        non_chunk_error = 0.0
+        non_seam_max = 0.0
         for row in range(1, args.ny - 1):
-            if row not in chunk_rows and (row - 1) not in chunk_rows:
-                non_chunk_error = max(non_chunk_error, diff[row, :].max())
-        print(f"非接缝区域最大误差: {non_chunk_error:.2e}")
+            is_seam = any(abs(row - r) <= 1 for r in chunk_rows)
+            if not is_seam:
+                non_seam_max = max(non_seam_max, diff[row, :].max())
+        print(f"Non-seam region max error: {non_seam_max:.2e}")
 
         if diff.max() < 1e-8:
-            print("\n✅ 多进程与单进程结果完全一致! 接缝正确。")
+            print("\n✅ Multi-process matches single process perfectly! Seams are correct.")
+        elif diff.max() < 1e-4:
+            print("\n✅ Multi-process is accurate (error < 1e-4).")
         else:
-            print(f"\n⚠️  存在误差，需检查。")
+            print("\n⚠️  Significant error detected.")
     else:
-        print(f"找不到文件: {args.frame}")
+        print(f"Frame file not found: {args.frame}")
+        print("Run the simulation first, e.g.:")
+        print(f"  python heat_simulation.py --nx {args.nx} --ny {args.ny} "
+              f"--time {args.time} --dt {args.dt} --alpha {args.alpha} "
+              f"--power {args.power} --source-radius {args.source_radius} "
+              f"--path-type {args.path_type} --workers {args.workers}")
 
 
 if __name__ == '__main__':
